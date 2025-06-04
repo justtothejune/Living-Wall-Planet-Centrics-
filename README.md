@@ -45,9 +45,9 @@ UART2 (PZEM-004T):
 ## Coding Part
 1. การเชื่อมต่อ Wi-Fi และ NTP
 
-  เชื่อมต่อ Wi-Fi ด้วย SSID/รหัสผ่าน แล้วตั้งอินสแตนซ์ WiFiClientSecure
+- เชื่อมต่อ Wi-Fi ด้วย SSID/รหัสผ่าน แล้วตั้งอินสแตนซ์ WiFiClientSecure
 
-  ซิงก์เวลาผ่าน NTP (โซนเวลา UTC+7)
+- ซิงก์เวลาผ่าน NTP (โซนเวลา UTC+7)
 ```python
 void connectWiFi() {
   Serial.printf("[WiFi] Connecting to \"%s\"\n", ssid);
@@ -85,7 +85,12 @@ if (now >= 7LL*3600) {
 }
 
 ```
-
+- ถ้าจะปรับเปลี่ยน Wifi และ Googlesheet ใหม่ ต้องไปแก้ที่ส่วนนี้ก่อน
+```python
+const char* ssid     = "PlanetCentric";
+const char* wifiPass = "BearLab!";
+const char* webAppUrl = "https://script.google.com/macros/s/…/exec";
+```
 2. การดึงค่า Configuration
 
 - ทุก 10 วินาที ทำ HTTP GET ไปยัง Google Apps Script เพื่อรับ JSON ที่ประกอบด้วย:
@@ -154,9 +159,9 @@ void fetchConfig() {
 }
 // ใน setup(): fetchConfig();
 ```
-3 การอ่าน PPFD และคำนวณ DLI
+3. การอ่าน PPFD และคำนวณ DLI
 - ทุก 5 วินาที (READ_INTERVAL):
-  1. อ่านค่า PPFD จากเซ็นเซอร์ผ่าน Modbus (node.readInputRegisters)[1]
+  1. อ่านค่า PPFD จากเซ็นเซอร์ผ่าน Modbus 
   2. เก็บลงบัฟเฟอร์ (ARRAY ขนาด 60 ค่า)
   3. คำนวณ DLI เพิ่มเติมด้วยสมการ:
 ```python
@@ -218,7 +223,6 @@ else if (ledMode == "Off") {
 float need    = (dynamicDLI - dliAcc) / 0.36f;  // ปรับตามสเปกตรัม LED
 ```
   - คำนวณเวลาที่เหลือจนถึง 06:00 น.: หากเวลาปัจจุบัน > 06:00 → ตั้งเป้าเป็น 06:00 ของวันรุ่นไป (เพิ่ม 24 ชั่วโมง)
-  - มิฉะนั้น → ตั้งเป้าเป็น 06:00 ของวันนี้
 ```python
 else { // Automatic
   applyAutoLED(m);
@@ -258,5 +262,142 @@ void applyAutoLED(unsigned long m) {
     ledWasOn = true;
     Serial.println("[LED][AUTO] LED OFF (auto)");
   }
+}
+```
+5. ตารางการรดน้ำ (Water Schedule)
+```python
+struct WaterSchedule {
+  bool en;
+  uint32_t startSec;
+  uint32_t durMs;
+};
+WaterSchedule water[7];
+bool triggered[7];
+int lastDayOfWeek = -1;
+bool pumpOn = false;
+unsigned long pumpStart = 0;
+int prevNowS = -1;
+
+// ใน loop():
+if (wday != lastDayOfWeek) {
+  lastDayOfWeek = wday;
+  for (int i = 0; i < 7; i++) triggered[i] = false;
+}
+
+if (!pumpOn
+    && water[wday].en
+    && !triggered[wday]
+    && prevNowS < water[wday].startSec
+    && nowS >= water[wday].startSec) {
+  digitalWrite(PUMP_PIN, HIGH);
+  pumpOn = true;
+  pumpStart = millis();
+  triggered[wday] = true;
+  Serial.println("[WATER] Pump ON");
+}
+if (pumpOn && (millis() - pumpStart >= water[wday].durMs)) {
+  digitalWrite(PUMP_PIN, LOW);
+  pumpOn = false;
+  Serial.println("[WATER] Pump OFF");
+}
+```
+- watering ถูกอัปเดตใน fetchConfig() ตาม JSON
+- เมื่อข้ามวันใหม่ ต้องเซ็ต triggered[] = false
+- ตรวจเงื่อนไขเวลาก่อน–หลังเพื่อสั่งเปิด/ปิดปั๊ม
+6. การวัดพลังงาน (Energy Metering)
+```python
+// อ่านค่า Energy (kWh), Power (W), Voltage (V), Current (A)
+float energyNow = pzem.energy();
+float powerNow  = pzem.power();
+float voltNow   = pzem.voltage();
+float currNow   = pzem.current();
+
+// หัก Baseline (รีเซ็ตเป็น 0 ที่ 06:00)
+float energyToUpload = energyNow - baselineEnergy;
+if (energyToUpload < 0) energyToUpload = 0;
+```
+- ทุกอัปโหลด (5 นาที) อ่าน pzem.energy() เพื่อให้ได้ kWh ปัจจุบัน
+- หักลบ baselineEnergy (ซึ่งรีเซ็ตเป็น 0 ที่เวลา 06:00) เพื่ออัปโหลดเฉพาะพลังงานของวันนั้น ๆ
+- อ่านพารามิเตอร์เพิ่มเติม pzem.power(), pzem.voltage(), pzem.current() (ไม่ต้องแปลงสมการอะไรเลยสามารถใช้คำสั่งปกติอ่านค่าได้เลย)
+
+7. การรีเซ็ตข้อมูลรายวัน (Daily Reset)
+- ตรวจ Edge Detection ข้าม 06:00:00 และ today != lastResetDay (สามารถปรับเวลาได้ตามที่ต้องการแต่ในระบบนี้เป็นรีเซ็ทตอน 6 โมงเช้า)
+- ตั้ง lastResetDay = today เพื่อป้องกันรีเซ็ตซ้ำในวันเดียวกัน
+- สร้างแท็บใหม่สำหรับ Google Sheets (sheetDate = "YYYY-MM-DD")
+- รีเซ็ตตัวสะสมทุกตัว และดึง config ใหม่ทันที
+```python
+if ((prevNowS < 6*3600) && (nowS >= 6*3600) && (today != lastResetDay)) {
+  lastResetDay = today;
+
+  // 3.1 รีเซ็ต DLI
+  dliAcc = 0.0f;
+  remainingDLI = dynamicDLI;
+
+  // 3.2 รีเซ็ต LED On Time
+  accumLedMs = 0UL;
+  if (ledMode == "On") {
+    digitalWrite(LED_RELAY_PIN, HIGH);
+    ledManualActive = true;
+    ledStart = millis();
+    Serial.println("[RESET] Manual ON (ledStart reset) @ crossed 6:00");
+  }
+  else {
+    digitalWrite(LED_RELAY_PIN, LOW);
+    ledManualActive = false;
+    ledAutoActive   = false;
+    ledWasOn        = false;
+    lastLedDur      = 0;
+    Serial.println("[RESET] LED OFF @ crossed 6:00");
+  }
+
+  // 3.3 รีเซ็ต Energy (PZEM)
+  if (pzem.resetEnergy()) {
+    baselineEnergy = 0.0f;
+    Serial.println("[RESET] Energy reset OK @ crossed 6:00");
+  }
+  else {
+    Serial.println("[RESET] Energy reset FAIL @ crossed 6:00");
+  }
+
+  // 3.4 รีเซ็ต lastUploadTime เพื่อรอขอบนาทีหาร 5
+  lastUploadTime = 0;
+
+  // 3.5 อัปเดต sheetDate (แท็บใหม่)
+  strftime(sheetDate, sizeof(sheetDate), "%Y-%m-%d", tp);
+  Serial.printf("[RESET] New sheetDate = %s @ crossed 6:00\n", sheetDate);
+
+  // 3.6 ดึง config ใหม่
+  fetchConfig();
+  Serial.println("[RESET] Completed Real Reset @ crossed 6:00");
+}
+```
+8. การอัปโหลดข้อมูล (Upload Data)
+- จะมีการอัพโหลดขึ้น Googlesheet ทุกๆ 5 นาทีของการเก็บข้อมูล ถ้าจะเปลี่ยนเวลาการอัพโหลดสามารถปรับเปลี่ยน Condition If ในบรรทัดแรกได้
+```python
+if ((localMin % 5 == 0) && (localSec < 30) && 
+    (millis() - lastUploadTime >= UPLOAD_INTERVAL*1000UL)) {
+  lastUploadTime = millis();
+  // ... คำนวณ avg, ledTime, energyToUpload, hrsLeft ...
+  char dateBuf[11];
+  strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", tp);
+  String url = String(webAppUrl) +
+    "?sheetName="     + String(sheetDate) +
+    "&ppfd="          + String(avg,2) +
+    "&dli="           + String(dliAcc,3) +
+    "&remaining_dli=" + String(remainingDLI,3) +
+    "&hours_left="    + String(hlStr) +
+    "&ledontime="     + String(ledTimeStr) +
+    "&energy_kwh="    + String(energyToUpload,3) +
+    "&power="         + String(powerNow,3) +
+    "&voltage="       + String(voltNow,3) +
+    "&current="       + String(currNow,3) +
+    "&date="          + String(dateBuf);
+  HTTPClient up;
+  if (up.begin(client, url)) {
+    int code2 = up.GET();
+    Serial.printf("[UPLOAD] HTTP %d\n", code2);
+    up.end();
+  }
+  Serial.printf("[DLI] Accumulated=%.5f\n", dliAcc);
 }
 ```
